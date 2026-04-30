@@ -71,7 +71,7 @@ _MODELS = {
                  'gamma': [0.0, 1.0],
                  'objective': ['binary:logistic'],
                  'nthread': [-1],
-                 'tree_method': ['gpu_hist']
+                 'tree_method': ['hist']
             },
         }
 
@@ -113,7 +113,7 @@ _MODELS = {
                  'gamma': [0.0, 1.0],
                  'objective': ['binary:logistic'],
                  'nthread': [-1],
-                 'tree_method': ['gpu_hist']
+                 'tree_method': ['hist']
             }
         }
 
@@ -139,7 +139,7 @@ _MODELS = {
                  'gamma': [0.0, 1.0],
                  'objective': ['reg:linear'],
                  'nthread': [-1],
-                 'tree_method': ['gpu_hist']
+                 'tree_method': ['hist']
             }
         },
         # {
@@ -204,7 +204,7 @@ def feat_transform(data, info, label_encoder = None, encoders = None, cmax = Non
             if encoder:
                 feature = encoder.transform(col)
             else:
-                encoder = OneHotEncoder(sparse=False, handle_unknown='ignore')
+                encoder = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
                 encoders[idx] = encoder
                 feature = encoder.fit_transform(col)
                 
@@ -294,7 +294,7 @@ class FeatureMaker:
                     if encoder:
                         feature = encoder.transform(col)
                     else:
-                        encoder = OneHotEncoder(sparse=False, handle_unknown='ignore')
+                        encoder = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
                         self.encoders[index] = encoder
                         feature = encoder.fit_transform(col)
 
@@ -511,8 +511,8 @@ def _evaluate_binary_classification(train, test, info):
 
             try:
                 model.fit(x_trains, y_trains)
-            except ValueError:
-                pass
+            except ValueError as _fit_err:
+                print(f"FIT_ERROR {type(model).__name__} {type(_fit_err).__name__}: {_fit_err}")
 
             if len(unique_labels) == 1:
                 pred = [unique_labels[0]] * len(x_valid)

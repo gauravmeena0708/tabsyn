@@ -99,7 +99,7 @@ def main(args):
         train_data,
         batch_size = batch_size,
         shuffle = True,
-        num_workers = 4,
+        num_workers = 0,
     )
 
     model = Model_VAE(NUM_LAYERS, d_numerical, categories, D_TOKEN, n_head = N_HEAD, factor = FACTOR, bias = True)
@@ -112,9 +112,9 @@ def main(args):
     pre_decoder.eval()
 
     optimizer = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WD)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.95, patience=10, verbose=True)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.95, patience=10)
 
-    num_epochs = 4000
+    num_epochs = args.epochs if getattr(args, 'epochs', 1000) != 1000 else 4000
     best_train_loss = float('inf')
 
     current_lr = optimizer.param_groups[0]['lr']
