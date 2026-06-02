@@ -1,0 +1,119 @@
+#!/usr/bin/env python
+"""TabSyn plugin `generate` endpoint: JSON request on stdin -> JSON result on stdout.
+
+Ported from the host's ``wrappers/tabsyn_wrapper.py`` (sample path). Consumes a
+pre-trained ``model_dir`` (never retrains): it reads ``model_dir/meta.json`` for
+the dataset + framework column names + original train CSV, samples unconditionally
+via the upstream sampler, trims/resamples to ``n_samples``, aligns columns to the
+framework schema, and writes exactly to the host-chosen ``output_csv_path``.
+
+Contract discipline: the single JSON result is the ONLY thing on stdout; logs and
+all upstream-process output go to stderr.
+"""
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import pandas as pd
+
+TABSYN_ROOT = Path(__file__).resolve().parents[1]
+STEPS = 50
+
+
+def log(msg: str) -> None:
+    print(f"[tabsyn] {msg}", file=sys.stderr, flush=True)
+
+
+def gpu_index(device: str) -> int:
+    if device and device.startswith("cuda") and ":" in device:
+        return int(device.split(":", 1)[1])
+    return 0
+
+
+def run_tabsyn(args: list[str]) -> None:
+    cmd = [sys.executable, *args]
+    log("$ " + " ".join(cmd))
+    subprocess.run(cmd, cwd=TABSYN_ROOT, check=True, stdout=sys.stderr, stderr=sys.stderr)
+
+
+def normalize_missing_categories(df: pd.DataFrame, train_csv: Path | None) -> pd.DataFrame:
+    """Replace NaN categoricals with the framework's "?" missing token where the
+    real training column already uses "?" (matches SDMetrics' detector)."""
+    if train_csv is None or not train_csv.exists():
+        return df
+    try:
+        train_df = pd.read_csv(train_csv)
+    except Exception as exc:
+        log(f"WARNING: failed to inspect train CSV missing tokens: {exc}")
+        return df
+    changed = []
+    for col in df.columns:
+        if col not in train_df.columns:
+            continue
+        if not train_df[col].astype(str).eq("?").any():
+            continue
+        missing = df[col].isna() | df[col].astype(str).isin(["nan", "NaN", "<NA>"])
+        n = int(missing.sum())
+        if n == 0:
+            continue
+        df[col] = df[col].replace({"nan": pd.NA, "NaN": pd.NA, "<NA>": pd.NA}).fillna("?")
+        changed.append(f"{col}={n}")
+    if changed:
+        log("Normalized categorical missing tokens: " + ", ".join(changed))
+    return df
+
+
+def main() -> int:
+    req = json.load(sys.stdin)
+    if req.get("constraints"):
+        print(json.dumps({"ok": False, "output_csv": None,
+                          "message": "tabsyn is unconditional; constraints are not supported"}))
+        return 0
+
+    n_samples = req["n_samples"]
+    seed = req.get("seed", 42)
+    gpu = gpu_index(req.get("device", "cuda"))
+    output_path = Path(req["output_csv_path"])
+
+    meta = json.loads((Path(req["model_dir"]) / "meta.json").read_text())
+    dataset = meta["dataset"]
+    framework_cols = meta.get("columns") or []
+    train_csv = Path(meta["train_csv"]) if meta.get("train_csv") else None
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = output_path.with_suffix(output_path.suffix + ".tabsyn_tmp")
+    run_tabsyn(["main.py", "--dataname", dataset, "--method", "tabsyn", "--mode", "sample",
+                "--gpu", str(gpu), "--steps", str(STEPS), "--save_path", str(tmp_path)])
+
+    df = pd.read_csv(tmp_path)
+    if len(df) == 0:
+        raise RuntimeError(f"TabSyn produced an empty CSV at {tmp_path}")
+
+    if n_samples != len(df):
+        replace = n_samples > len(df)
+        log(f"Adjusting row count {len(df)} -> {n_samples} (replace={replace})")
+        df = df.sample(n=n_samples, replace=replace, random_state=seed).reset_index(drop=True)
+
+    # TabSyn emits real UCI column names; the framework uses col0..colN/label.
+    if framework_cols and list(df.columns) != framework_cols:
+        if len(df.columns) == len(framework_cols):
+            log(f"Renaming columns to framework schema ({list(df.columns)[:3]}... -> {framework_cols[:3]}...)")
+            df.columns = framework_cols
+        else:
+            log(f"WARNING: column count mismatch (synth={len(df.columns)}, "
+                f"framework={len(framework_cols)}); skipping rename")
+
+    df = normalize_missing_categories(df, train_csv)
+    df.to_csv(output_path, index=False)
+    tmp_path.unlink(missing_ok=True)
+    log(f"Saved synthetic CSV to {output_path}")
+
+    print(json.dumps({"ok": True, "output_csv": str(output_path), "message": ""}))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

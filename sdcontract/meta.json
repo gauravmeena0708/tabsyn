@@ -1,0 +1,13 @@
+{
+  "schema_version": "1.0",
+  "plugin": "tabsyn",
+  "version": "0.1.0",
+  "env": "tabsyn",
+  "entrypoints": {
+    "train": ["python", "sdcontract/train"],
+    "generate": ["python", "sdcontract/generate"]
+  },
+  "methods": {
+    "tabsyn": { "variant": null }
+  }
+}

@@ -1,0 +1,197 @@
+#!/usr/bin/env python
+"""TabSyn plugin `train` endpoint: JSON request on stdin -> JSON result on stdout.
+
+Ported from the host's ``wrappers/tabsyn_wrapper.py`` (train path). TabSyn is
+unconditional: it trains a VAE then a diffusion model for the named dataset under
+``sub/tabsyn/tabsyn/{vae/ckpt,ckpt}/<dataset>`` (reusing existing checkpoints),
+then writes ``model_dir/meta.json`` describing the trained artifact.
+
+Contract discipline: the single JSON result is the ONLY thing on stdout; every
+log line and all upstream-process output go to stderr.
+"""
+from __future__ import annotations
+
+import datetime
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import pandas as pd
+
+TABSYN_ROOT = Path(__file__).resolve().parents[1]
+TRAIN_LOCK_DIR = ".train_lock"
+VAE_EPOCHS = 4000
+DIFFUSION_EPOCHS = 10001
+
+
+def log(msg: str) -> None:
+    print(f"[tabsyn] {msg}", file=sys.stderr, flush=True)
+
+
+def gpu_index(device: str) -> int:
+    if device and device.startswith("cuda") and ":" in device:
+        return int(device.split(":", 1)[1])
+    return 0
+
+
+class ModelDirLock:
+    def __init__(self, model_dir: Path, poll_seconds: float = 2.0, timeout_seconds: float = 7200.0):
+        self.lock_dir = model_dir / TRAIN_LOCK_DIR
+        self.poll_seconds = poll_seconds
+        self.timeout_seconds = timeout_seconds
+
+    def __enter__(self):
+        deadline = time.monotonic() + self.timeout_seconds
+        while True:
+            try:
+                os.mkdir(self.lock_dir)
+                return self
+            except FileExistsError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"Could not acquire TabSyn training lock {self.lock_dir} after "
+                        f"{self.timeout_seconds:.0f}s."
+                    )
+                time.sleep(self.poll_seconds)
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            os.rmdir(self.lock_dir)
+        except FileNotFoundError:
+            pass
+
+
+def run_tabsyn(args: list[str]) -> None:
+    cmd = [sys.executable, *args]
+    log("$ " + " ".join(cmd))
+    # Inherit nothing onto our stdout: upstream chatter must land on stderr.
+    subprocess.run(cmd, cwd=TABSYN_ROOT, check=True, stdout=sys.stderr, stderr=sys.stderr)
+
+
+def processed_data_ready(dataset: str) -> bool:
+    data_dir = TABSYN_ROOT / "data" / dataset
+    required = ["info.json", "train.csv", "test.csv",
+                "X_num_train.npy", "X_cat_train.npy", "y_train.npy"]
+    return all((data_dir / name).exists() for name in required)
+
+
+def raw_data_ready(dataset: str) -> bool:
+    info_path = TABSYN_ROOT / "data" / "Info" / f"{dataset}.json"
+    if not info_path.exists():
+        return False
+    info = json.loads(info_path.read_text(encoding="utf-8"))
+    raw_paths = [info.get("data_path"), info.get("test_path")]
+    return all(not rel or (TABSYN_ROOT / rel).exists() for rel in raw_paths)
+
+
+def ensure_processed_data(dataset: str) -> None:
+    if processed_data_ready(dataset):
+        return
+    info_path = TABSYN_ROOT / "data" / "Info" / f"{dataset}.json"
+    if not info_path.exists():
+        raise FileNotFoundError(
+            f"TabSyn has no data/Info entry for dataset '{dataset}'. "
+            "Add a TabSyn-compatible data config before using this plugin."
+        )
+    if not raw_data_ready(dataset):
+        log("Raw TabSyn data missing; running upstream download_dataset.py")
+        run_tabsyn(["download_dataset.py"])
+    (TABSYN_ROOT / "data" / dataset).mkdir(parents=True, exist_ok=True)
+    log(f"Processing dataset '{dataset}' with upstream process_dataset.py")
+    run_tabsyn(["process_dataset.py", "--dataname", dataset])
+    if not processed_data_ready(dataset):
+        raise RuntimeError(f"TabSyn processing did not create required files for '{dataset}'")
+
+
+def vae_ready(dataset: str) -> bool:
+    ckpt = TABSYN_ROOT / "tabsyn" / "vae" / "ckpt" / dataset
+    return all((ckpt / n).exists() for n in ("encoder.pt", "decoder.pt", "train_z.npy"))
+
+
+def diffusion_ready(dataset: str) -> bool:
+    return (TABSYN_ROOT / "tabsyn" / "ckpt" / dataset / "model.pt").exists()
+
+
+def train_if_needed(dataset: str, gpu: int, model_dir: Path) -> dict | None:
+    model_dir.mkdir(parents=True, exist_ok=True)
+    training_resources: dict | None = None
+    with ModelDirLock(model_dir):
+        needs_vae = not vae_ready(dataset)
+        needs_diffusion = not diffusion_ready(dataset)
+        if needs_vae or needs_diffusion:
+            start = time.monotonic()
+            if needs_vae:
+                log(f"Training VAE for {dataset}")
+                run_tabsyn(["main.py", "--dataname", dataset, "--method", "vae",
+                            "--mode", "train", "--gpu", str(gpu), "--epochs", str(VAE_EPOCHS)])
+            else:
+                log(f"Reusing existing VAE checkpoint for {dataset}")
+            if needs_diffusion:
+                log(f"Training diffusion model for {dataset}")
+                run_tabsyn(["main.py", "--dataname", dataset, "--method", "tabsyn",
+                            "--mode", "train", "--gpu", str(gpu), "--epochs", str(DIFFUSION_EPOCHS)])
+            else:
+                log(f"Reusing existing diffusion checkpoint for {dataset}")
+            elapsed = time.monotonic() - start
+            training_resources = {
+                "vae_trained": needs_vae, "diffusion_trained": needs_diffusion,
+                "vae_epochs": VAE_EPOCHS, "diffusion_epochs": DIFFUSION_EPOCHS,
+                "training_seconds": elapsed, "model_training_seconds": elapsed,
+            }
+        else:
+            log(f"Reusing existing VAE + diffusion checkpoints for {dataset}")
+    return training_resources
+
+
+def main() -> int:
+    req = json.load(sys.stdin)
+    dataset = req["dataset"]
+    model_dir = Path(req["output_model_dir"])
+    gpu = gpu_index(req.get("device", "cuda"))
+    train_csv = Path(req["train_csv"]) if req.get("train_csv") else None
+
+    if not TABSYN_ROOT.exists():
+        raise FileNotFoundError(f"TabSyn checkout not found at {TABSYN_ROOT}")
+
+    ensure_processed_data(dataset)
+    training_resources = train_if_needed(dataset, gpu, model_dir)
+
+    columns = None
+    if train_csv and train_csv.exists():
+        columns = list(pd.read_csv(train_csv, nrows=0).columns)
+
+    meta = {
+        "schema_version": "1.0",
+        "method": req["method"],
+        "dataset": dataset,
+        "label_column": req.get("label_column"),
+        "columns": columns or [],
+        "trained_at": datetime.datetime.utcnow().isoformat() + "Z",
+        "sdcontract_core_version": "1.0",
+        # Method-specific extras (read by ui2 artifacts + the generate endpoint):
+        "tabsyn_root": str(TABSYN_ROOT),
+        "processed_data_dir": str(TABSYN_ROOT / "data" / dataset),
+        "vae_checkpoint_dir": str(TABSYN_ROOT / "tabsyn" / "vae" / "ckpt" / dataset),
+        "diffusion_checkpoint_dir": str(TABSYN_ROOT / "tabsyn" / "ckpt" / dataset),
+        "train_csv": str(train_csv) if train_csv else None,
+    }
+    # Carry forward training_resources across reuse runs if previously recorded.
+    meta_path = model_dir / "meta.json"
+    if training_resources is None and meta_path.exists():
+        try:
+            training_resources = json.loads(meta_path.read_text()).get("training_resources")
+        except Exception:
+            training_resources = None
+    if training_resources:
+        meta["training_resources"] = training_resources
+    meta_path.write_text(json.dumps(meta, indent=2))
+
+    print(json.dumps({"ok": True, "model_dir": str(model_dir), "message": ""}))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
