@@ -4,10 +4,10 @@
     "kinds": [],
     "ops": [],
     "aggs": [],
-    "column_types": ["numerical", "categorical"],
+    "column_types": [],
     "supports_unconditional": true,
     "supports_multi_constraint": false,
-    "max_constraints": null,
+    "max_constraints": 0,
     "requires_gpu": true
   }
 }

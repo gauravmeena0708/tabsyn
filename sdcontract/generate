@@ -13,6 +13,8 @@ all upstream-process output go to stderr.
 from __future__ import annotations
 
 import json
+import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -21,6 +23,10 @@ import pandas as pd
 
 TABSYN_ROOT = Path(__file__).resolve().parents[1]
 STEPS = 50
+# Framework category labels are "<prefix><integer-code>" (csdata convention, e.g.
+# SEX 1 -> "S1", PAY -2 -> "P-2"); TabSyn's own pipeline emits the raw integer
+# code instead. This matches a single non-digit prefix + signed integer.
+_CODE_LABEL_RE = re.compile(r"([^\d-]*)(-?\d+)")
 
 
 def log(msg: str) -> None:
@@ -33,10 +39,64 @@ def gpu_index(device: str) -> int:
     return 0
 
 
-def run_tabsyn(args: list[str]) -> None:
+def run_tabsyn(args: list[str], env: dict[str, str] | None = None) -> None:
     cmd = [sys.executable, *args]
     log("$ " + " ".join(cmd))
-    subprocess.run(cmd, cwd=TABSYN_ROOT, check=True, stdout=sys.stderr, stderr=sys.stderr)
+    
+    run_env = os.environ.copy()
+    if env:
+        run_env.update(env)
+        
+    subprocess.run(cmd, cwd=TABSYN_ROOT, env=run_env, check=True, stdout=sys.stderr, stderr=sys.stderr)
+
+
+def align_categorical_labels(df: pd.DataFrame, train_csv: Path | None) -> pd.DataFrame:
+    """Map TabSyn's raw integer category codes onto the framework's string labels.
+
+    TabSyn trains on its own raw source (e.g. SEX=1, EDUCATION=0..6), but the
+    framework relabels categoricals via csdata to "<prefix><code>" (S1, E0, P-2,
+    L0). The eval scores categories by exact value, so the raw codes match nothing
+    and coverage collapses. Using the real train CSV as the reference, remap each
+    string categorical whose values don't already match by their integer code.
+    No-op for datasets whose categories are already aligned (e.g. adult).
+    """
+    if train_csv is None or not train_csv.exists():
+        return df
+    try:
+        train_df = pd.read_csv(train_csv)
+    except Exception as exc:
+        log(f"WARNING: failed to inspect train CSV for category alignment: {exc}")
+        return df
+    changed = []
+    for col in df.columns:
+        if col not in train_df.columns or train_df[col].dtype != object:
+            continue
+        fw_vals = set(train_df[col].dropna().astype(str).unique())
+        syn_vals = set(df[col].dropna().astype(str).unique())
+        if syn_vals <= fw_vals:
+            continue  # already aligned
+        code_to_label: dict[str, str] = {}
+        for label in fw_vals:
+            m = _CODE_LABEL_RE.fullmatch(label)
+            if not m:
+                code_to_label = {}
+                break
+            code_to_label[m.group(2)] = label
+        if not code_to_label or len(code_to_label) != len(fw_vals):
+            continue  # labels aren't a clean prefix+code scheme; leave untouched
+
+        def to_label(v):
+            try:
+                key = str(int(float(v)))
+            except (ValueError, TypeError):
+                key = str(v)
+            return code_to_label.get(key, v)
+
+        df[col] = df[col].map(to_label)
+        changed.append(col)
+    if changed:
+        log("Aligned categorical codes to framework labels: " + ", ".join(changed))
+    return df
 
 
 def normalize_missing_categories(df: pd.DataFrame, train_csv: Path | None) -> pd.DataFrame:
@@ -85,8 +145,19 @@ def main() -> int:
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = output_path.with_suffix(output_path.suffix + ".tabsyn_tmp")
+    
+    # If running from a bundle, the model_dir will contain vae/ and diffusion/
+    model_dir_path = Path(req["model_dir"])
+    env = None
+    if (model_dir_path / "vae").exists() and (model_dir_path / "diffusion").exists():
+        env = {
+            "TABSYN_DATA_DIR": str(model_dir_path / "data"),
+            "TABSYN_CKPT_DIR": str(model_dir_path / "diffusion"),
+            "TABSYN_VAE_CKPT_DIR": str(model_dir_path / "vae"),
+        }
+        
     run_tabsyn(["main.py", "--dataname", dataset, "--method", "tabsyn", "--mode", "sample",
-                "--gpu", str(gpu), "--steps", str(STEPS), "--save_path", str(tmp_path)])
+                "--gpu", str(gpu), "--steps", str(STEPS), "--save_path", str(tmp_path)], env=env)
 
     df = pd.read_csv(tmp_path)
     if len(df) == 0:
@@ -106,6 +177,7 @@ def main() -> int:
             log(f"WARNING: column count mismatch (synth={len(df.columns)}, "
                 f"framework={len(framework_cols)}); skipping rename")
 
+    df = align_categorical_labels(df, train_csv)
     df = normalize_missing_categories(df, train_csv)
     df.to_csv(output_path, index=False)
     tmp_path.unlink(missing_ok=True)
