@@ -208,6 +208,11 @@ def prepare_processed_data_from_train_csv(
     info_dir.mkdir(parents=True, exist_ok=True)
     (info_dir / f"{dataset}.json").write_text(json.dumps(info, indent=4))
     log(f"Built TabSyn Info for '{dataset}' from {train_csv}")
+    # process_dataset.py only regenerates test.data when absent; a stale cache
+    # from an earlier source CSV would otherwise shadow the freshly-copied data.
+    stale_test_data = data_dir / "test.data"
+    if stale_test_data.exists():
+        stale_test_data.unlink()
     run_tabsyn(["process_dataset.py", "--dataname", dataset])
     if not processed_data_ready(dataset):
         raise RuntimeError(f"TabSyn processing did not create required files for '{dataset}'")
