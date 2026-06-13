@@ -1,0 +1,27 @@
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+
+# Runtime dataset copies written by sd_framework.
+# data/Info/ originals stay tracked; framework-generated copies are ignored.
+data/*/
+!data/Info/
+data/Info/compas.json
+data/Info/custom.json
+data/Info/german.json
+data/Info/health_heritage.json
+
+# Model checkpoints
+tabsyn/ckpt/
+tabsyn/vae/ckpt/
+
+# Evaluation outputs (eval/*.py and eval/mle/*.py stay tracked)
+eval/density/
+eval/quality/
+eval/mle/*/
+eval_logs/
+
+# Generation outputs / scratch
+synthetic/
+workspace/
+tabsyn_steps.txt
