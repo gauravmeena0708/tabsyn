@@ -81,6 +81,12 @@ or via conda
 conda install pytorch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 pytorch-cuda=11.7 -c pytorch -c nvidia
 ```
 
+> **Blackwell GPUs (sm_120, e.g. RTX PRO 6000):** the cu117 pin above does not
+> support sm_120. Install a CUDA 12.8 build instead:
+> ```
+> pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+> ```
+
 Install other dependencies
 
 ```
